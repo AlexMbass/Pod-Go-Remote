@@ -76,6 +76,29 @@
   pre#log { background: #0b0c0e; border: 1px solid var(--line); border-radius: 10px; padding: 10px; font: 12px/1.45 ui-monospace, Menlo, Consolas, monospace; color: #c9d1d9; max-height: 260px; overflow: auto; white-space: pre-wrap; margin: 8px 0; }
   label.inline { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 14px; margin-top: 12px; }
   select { font: inherit; background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; }
+  /* Cadena de bloques */
+  .chain { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  .blk {
+    display: grid; grid-template-columns: 6px 1fr auto; align-items: center; gap: 12px;
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 12px;
+    padding: 10px 10px 10px 0; min-height: 60px; overflow: hidden;
+  }
+  .blk .bar { align-self: stretch; background: var(--cat, var(--muted)); border-radius: 0 4px 4px 0; }
+  .blk .txt { min-width: 0; }
+  .blk .cat { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--cat, var(--muted)); font-weight: 700; }
+  .blk .mdl { font-size: 17px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .blk.off .mdl, .blk.off .cat { opacity: .45; }
+  .blk.off .bar { opacity: .35; }
+  .blk.empty { opacity: .5; }
+  .tog {
+    width: 64px; min-height: 40px; padding: 0; border-radius: 99px; font-size: 13px; font-weight: 800; letter-spacing: .06em;
+    background: #2b3036; color: var(--muted);
+  }
+  .tog.on { background: var(--ok); border-color: var(--ok); color: #062512; }
+  .tog.busy { opacity: .5; }
+  .catload { display: flex; flex-direction: column; gap: 10px; }
+  .catload input[type=file] { display: none; }
+  .ok-text { color: var(--ok); }
   footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 18px; }
   footer a { color: var(--muted); }
 </style>
@@ -107,6 +130,12 @@
   <p class="hint" id="snapHint">Snapshots: toca para cambiar.</p>
 </section>
 
+<section id="chainBox" class="hidden">
+  <h2>Cadena de bloques</h2>
+  <ul class="chain" id="chain"></ul>
+  <p class="hint" id="chainHint">Toca ON/OFF para prender o apagar un bloque. Es temporal: si cambias de preset sin guardar en el pedal, vuelve como estaba.</p>
+</section>
+
 <section id="pickBox" class="hidden">
   <h2>Presets</h2>
   <div class="banknav">
@@ -125,6 +154,15 @@
 </section>
 
 <section>
+  <h2>Catálogo de modelos</h2>
+  <div class="catload">
+    <div id="catStatus" class="meta">Sin catálogo: los bloques salen como "Modelo #".</div>
+    <label><button id="btnCatalog" class="wide" type="button">Cargar podgo-catalogo.json</button><input id="catFile" type="file" accept=".json,application/json"></label>
+    <p class="hint">Se guarda solo en este teléfono. Sale de tu instalación de Pod Go Edit, así que no lo subas al GitHub público.</p>
+  </div>
+</section>
+
+<section>
   <details>
     <summary>Diagnóstico</summary>
     <pre id="log"></pre>
@@ -136,7 +174,7 @@
 </section>
 
 <footer>
-  v0.1.1 · solo lectura por USB + cambios por MIDI · protocolo basado en
+  v0.2 · bloques por USB + cambios por MIDI · protocolo basado en
   <a href="https://github.com/john-baxter-dev/fretwire" target="_blank" rel="noopener">fretwire</a>
 </footer>
 
@@ -192,7 +230,7 @@
 
   // Claves del sobre MessagePack
   const K = { TXN: 102, OP: 100, TARGET: 101, KIND: 103, PAYLOAD: 104 };
-  const OP = { READ_OPEN: 76, READ_PREP: 24, READ_INFO: 23 };
+  const OP = { READ_OPEN: 76, READ_PREP: 24, READ_INFO: 23, STREAM_START: 22, BYPASS: 41 };
 
   // ---------------------------------------------------------------- utilidades
   function hex(bytes) {
@@ -380,6 +418,73 @@
   const readOpen = (txn) => mpEncode(omap([[K.TXN, txn], [K.OP, OP.READ_OPEN], [K.TARGET, omap([])]]));
   const readPrep = (txn) => mpEncode(omap([[K.TXN, txn], [K.OP, OP.READ_PREP], [K.TARGET, omap([[118, 128]])]]));
   const readInfo = (txn) => mpEncode(omap([[K.TXN, txn], [K.OP, OP.READ_INFO], [K.TARGET, null]]));
+  const streamStart = (txn) => mpEncode(omap([[K.TXN, txn], [K.OP, OP.STREAM_START], [K.TARGET, null]]));
+  /** Prender (enabled=true) o apagar un bloque. Solo cambia el buffer de edición: no se guarda. */
+  const bypass = (slot, enabled, txn) =>
+    mpEncode(omap([[K.TXN, txn], [K.OP, OP.BYPASS], [K.TARGET, omap([[98, slot], [59, !!enabled]])]]));
+
+  /** Largo total que declara el primer trozo del preset (cabecera TLV + contenido). */
+  function declaredStreamLen(chunk0) {
+    if (chunk0.length < 8) return null;
+    const len = new DataView(chunk0.buffer, chunk0.byteOffset).getUint32(4, true);
+    const total = len + 8;
+    return total > 8 && total <= 1 << 20 ? total : null;
+  }
+
+  /**
+   * Decodifica el preset completo: los 10 bloques de la cadena y los 4 snapshots.
+   * Bloque: {slot, model, paired, enabled, cls, looper, params}
+   */
+  function parsePresetStream(stream) {
+    const env = locateRoot(stream, 32, (v) => mget(v, K.PAYLOAD) instanceof Uint8Array);
+    if (!env) throw new Error("el preset no trae su sobre (clave 104)");
+    const blob = mget(env.value, K.PAYLOAD);
+    let r = mpDecode(blob, 0);
+    if (text(r.value) !== "l6-helix") throw new Error("el preset no empieza con l6-helix");
+    r = mpDecode(blob, r.end); // tabla de offsets (no la necesitamos para leer)
+    r = mpDecode(blob, r.end);
+    const preset = r.value;
+    if (!(preset instanceof Map)) throw new Error("el preset no es un mapa");
+
+    const device = text(mget(mget(preset, 7), 36));
+    const blocks = [];
+    const slots = mget(mget(preset, 0), 22) || [];
+    slots.forEach((sl, i) => {
+      const kind = mget(sl, 19);
+      const c = mget(sl, 20);
+      if (kind === 6 && c instanceof Map) {
+        const meta = mget(c, 24);
+        const bank = mget(c, 11);
+        blocks.push({
+          slot: i, kind, looper: false,
+          model: mget(meta, 25), paired: mget(meta, 26),
+          enabled: mget(c, 10) !== false, cls: mget(c, 9),
+          params: (bank && mget(bank, 4)) || [],
+        });
+      } else if (kind === 7 && c instanceof Map) {
+        const bank = mget(c, 7);
+        blocks.push({
+          slot: i, kind, looper: true, model: mget(c, 8), paired: -1,
+          enabled: mget(c, 10) !== false, cls: mget(c, 9),
+          params: (bank && mget(bank, 4)) || [],
+        });
+      } else if (kind === 8) {
+        blocks.push({ slot: i, kind, empty: true });
+      }
+    });
+
+    const snapshots = [];
+    const snapList = mget(mget(preset, 10), 10) || [];
+    snapList.forEach((s, i) => {
+      const states = mget(s, 3) || [];
+      snapshots.push({
+        index: i,
+        name: text(mget(s, 4)) || `SNAPSHOT ${i + 1}`,
+        enabled: states.map((st) => (Array.isArray(st) ? st[1] !== false : true)),
+      });
+    });
+    return { device, blocks, snapshots };
+  }
 
   /** El saludo que Pod Go Edit hace al conectarse: 3 canales, en orden primario → edición → estado. */
   function handshakeFrames() {
@@ -607,18 +712,85 @@
       });
     }
 
+    // Pasos de lectura, igual que Pod Go Edit en una captura real: op 76 → op 23 (→ op 22).
+    // (El paso 24 viene del Helix; el Pod Go lo rechaza con -3 y Pod Go Edit nunca lo manda.)
+    async _readOpen() {
+      const t = ++this.txn;
+      await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, readOpen(t)), t, { op: 76, tolerate: true });
+    }
+    async _readInfo() {
+      const t = ++this.txn;
+      const r = await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readInfo(t)), t, { op: 23 });
+      const info = parsePresetInfo(r.body);
+      if (!info) this.log("respuesta de op 23 sin preset: " + hex(r.body.slice(0, 64)));
+      return info;
+    }
+
     /** Qué preset y snapshot están activos, sin descargar el preset completo. */
     readIdentity() {
       return this.exclusive(async () => {
-        let t = ++this.txn;
-        await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, readOpen(t)), t, { op: 76, tolerate: true });
-        t = ++this.txn;
-        await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readPrep(t)), t, { op: 24, tolerate: true });
-        t = ++this.txn;
-        const r = await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readInfo(t)), t, { op: 23 });
-        const info = parsePresetInfo(r.body);
-        if (!info) this.log("respuesta de op 23 sin preset: " + hex(r.body.slice(0, 64)));
-        return info;
+        await this._readOpen();
+        return this._readInfo();
+      });
+    }
+
+    /**
+     * Descarga el preset completo (≈4.4 KB en trozos de 256 bytes) y lo decodifica.
+     * Devuelve {info, device, blocks, snapshots}.
+     */
+    readPreset() {
+      return this.exclusive(async () => {
+        const started = Date.now();
+        await this._readOpen();
+        const info = await this._readInfo();
+        const t = ++this.txn;
+        const first = await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, streamStart(t)), t, { op: 22 });
+        const target = declaredStreamLen(first.body);
+        const parts = [first.body];
+        let have = first.body.length, empties = 0;
+        const cap = target ? Math.floor(target / 32) + 16 : 4096;
+        const [src, dst] = CH.EDIT;
+        for (let i = 0; i < cap; i++) {
+          if (target && have >= target) break;
+          if (Date.now() - started > 15000) throw new Error(`la lectura del preset se quedó en ${have} de ${target ?? "?"} bytes`);
+          const frame = { src, dst, seq: this.nextSeq(src), cmd: CMD.CHUNK, arg: this.curArg(src), body: new Uint8Array(0) };
+          const chunk = await this.request(frame, 3000);
+          this.advanceArg(src, chunk.body.length);
+          const n = chunk.body.length;
+          if (target) {
+            if (n === 0 && have < target) { if (++empties >= 8) break; continue; }
+            parts.push(chunk.body); have += n;
+            if (have >= target) break;
+          } else {
+            parts.push(chunk.body); have += n;
+            if (n < first.body.length) break;
+          }
+        }
+        if (target && have !== target) throw new Error(`el preset llegó incompleto (${have} de ${target} bytes)`);
+        const stream = concat(parts);
+        const preset = parsePresetStream(stream);
+        // El pedal puede contestar el op 23 con el preset anterior justo después de un cambio:
+        // se vuelve a preguntar después de bajar el preset (lo mismo que hace fretwire).
+        let after = info;
+        try { after = (await this._readInfo()) || info; } catch (_) { /* no es fatal */ }
+        preset.info = after;
+        preset.moved = !!(info && after && (info.index !== after.index || info.bank !== after.bank));
+        return preset;
+      });
+    }
+
+    /**
+     * Prende o apaga un bloque (op 41). Solo cambia lo que suena ahora: si cambias de preset
+     * sin guardar en el pedal, vuelve como estaba. No se escribe nada en la memoria del pedal.
+     */
+    setEnabled(slot, enabled) {
+      if (!Number.isInteger(slot) || slot < 1 || slot > 10) return Promise.reject(new Error("bloque fuera de la cadena"));
+      return this.exclusive(async () => {
+        const t = ++this.txn;
+        await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, bypass(slot, enabled, t)), t, { op: 41 });
+        // El "flush" que manda Pod Go Edit después de cada edición; no espera respuesta.
+        const [src, dst] = CH.EDIT;
+        await this.send({ src, dst, seq: this.nextSeq(src), cmd: CMD.CHUNK, arg: this.curArg(src), body: new Uint8Array(0) });
       });
     }
 
@@ -670,7 +842,7 @@
   const API = {
     VENDOR_ID, PRODUCTS, CONTROL_INTERFACE, EP_OUT, EP_IN, CH, CMD, OP, K,
     hex, fromHex, encodeFrame, decodeAll, tlvCommand, mpEncode, mpDecode, omap,
-    readOpen, readPrep, readInfo, handshakeFrames, replyTxn, replyRefusal,
+    readOpen, readPrep, readInfo, streamStart, bypass, declaredStreamLen, parsePresetStream, handshakeFrames, replyTxn, replyRefusal,
     parsePresetInfo, parseStatusPush, asciiRun, slotLabel, locateRoot, Session,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = API;
@@ -716,6 +888,44 @@
   let viewBank = 0;   // banco que muestra el selector (0..31)
   let tunerOn = false;
   let refreshTimer = null;
+  let preset = null;  // {blocks, snapshots, info}
+  let catalog = null; // [[nombre, categoría, params], ...] indexado por el número de modelo
+  let wantConnected = false; // el usuario conectó y no ha desconectado a propósito
+  let connecting = false;
+  let wakeLock = null;
+
+  // ------------------------------------------------------------- catálogo
+  const CAT_COLORS = {
+    "Amp": "#ff7a1a", "Preamp": "#ff9a4d", "Cab": "#c98a5a", "IR": "#c98a5a", "Drive": "#ffcc4d",
+    "Delay": "#4dabff", "Reverb": "#9b7bff", "Mod": "#3ddcc0", "Wah": "#ff6fae", "Vol/Pan": "#8b949e",
+    "EQ": "#b4e05c", "Comp": "#e0e05c", "Gate": "#a0a8b0", "FX Loop": "#8b949e", "Pitch": "#ff5c8a",
+    "Synth": "#d47bff", "Filter": "#ff8f6b", "Looper": "#6be0ff",
+  };
+  function loadCatalogText(textJson, fromFile) {
+    const data = JSON.parse(textJson);
+    if (!data || !Array.isArray(data.models) || data.models.length < 100) throw new Error("no parece un podgo-catalogo.json");
+    catalog = data.models;
+    $("catStatus").innerHTML = `<span class="ok-text">✓ Catálogo cargado:</span> ${catalog.length} modelos`;
+    $("btnCatalog").textContent = "Reemplazar catálogo";
+    if (fromFile) {
+      try { localStorage.setItem("pgr.catalog", textJson); } catch (_) { log("no pude guardar el catálogo en el teléfono (espacio)"); }
+    }
+    renderChain();
+  }
+  try { const saved = localStorage.getItem("pgr.catalog"); if (saved) loadCatalogText(saved, false); } catch (_) {}
+  $("btnCatalog").addEventListener("click", () => $("catFile").click());
+  $("catFile").addEventListener("change", async () => {
+    const f = $("catFile").files[0];
+    if (!f) return;
+    try { loadCatalogText(await f.text(), true); log("catálogo cargado: " + catalog.length + " modelos"); }
+    catch (e) { log("no pude cargar el catálogo: " + e.message); $("catStatus").textContent = "Ese archivo no es el catálogo."; }
+    $("catFile").value = "";
+  });
+  function modelInfo(idx) {
+    const m = catalog && catalog[idx];
+    if (m) return { name: m[0], cat: m[1] };
+    return { name: `Modelo #${idx}`, cat: "" };
+  }
 
   for (let c = 1; c <= 16; c++) {
     const o = document.createElement("option");
@@ -779,12 +989,26 @@
     }
   }
 
+  const isPodGo = (d) => d && d.vendorId === P.VENDOR_ID && P.PRODUCTS[d.productId] !== undefined;
+
   async function connect() {
     try {
-      setStatus("busy", "Conectando…");
-      device = await navigator.usb.requestDevice({
+      const dev = await navigator.usb.requestDevice({
         filters: Object.keys(P.PRODUCTS).map((pid) => ({ vendorId: P.VENDOR_ID, productId: Number(pid) })),
       });
+      await connectDevice(dev);
+    } catch (e) {
+      if (e && e.name === "NotFoundError") { setStatus("", "Desconectado"); log("no escogiste ningún dispositivo"); return; }
+      log("error: " + (e && e.message || e));
+    }
+  }
+
+  async function connectDevice(dev) {
+    if (connecting || session) return;
+    connecting = true;
+    try {
+      setStatus("busy", "Conectando…");
+      device = dev;
       log(`dispositivo: ${device.productName || P.PRODUCTS[device.productId]} (PID 0x${device.productId.toString(16)})`);
       if (/^P\d\d$/.test(device.productName || "")) {
         throw new Error("el pedal parece estar actualizando firmware — no lo toco");
@@ -800,33 +1024,107 @@
         session.keepalive().catch((e) => onLost(e));
       }, 250);
       setStatus("on", "Conectado");
+      wantConnected = true;
       $("btnDisconnect").disabled = false;
       $("connectBox").classList.add("hidden");
       $("nowBox").classList.remove("hidden");
+      $("chainBox").classList.remove("hidden");
       $("pickBox").classList.remove("hidden");
+      keepScreenOn();
       await refresh();
       await connectMidi();
     } catch (e) {
-      if (e && e.name === "NotFoundError") { setStatus("", "Desconectado"); log("no escogiste ningún dispositivo"); return; }
       log("error: " + (e && e.message || e));
       setStatus("err", "Error");
       await teardown(false);
+    } finally {
+      connecting = false;
     }
   }
 
-  async function refresh() {
+  async function refresh(retry = true) {
     if (!session) return;
     try {
-      const info = await session.readIdentity();
-      if (!info) { log("el pedal respondió, pero no entendí el preset"); return; }
-      current = info;
-      viewBank = Math.floor(info.index / 4);
+      const t0 = Date.now();
+      const p = await session.readPreset();
+      preset = p;
+      if (p.info) {
+        current = p.info;
+        viewBank = Math.floor(p.info.index / 4);
+      }
       render();
-      log(`preset ${info.bank === 1 ? "User" : "Factory"} ${P.slotLabel(info.index)} "${info.name}", snapshot ${info.snapshot === null ? "?" : info.snapshot + 1}`);
+      renderChain();
+      const info = p.info || {};
+      log(`preset ${info.bank === 1 ? "User" : "Factory"} ${P.slotLabel(info.index ?? 0)} "${info.name}", snapshot ${info.snapshot == null ? "?" : info.snapshot + 1} — ${p.blocks.filter((b) => !b.empty).length} bloques en ${Date.now() - t0} ms`);
+      if (p.moved && retry) { log("el pedal cambió mientras leía; leo otra vez"); return refresh(false); }
     } catch (e) {
-      log("no pude leer el preset: " + e.message);
+      log("no pude bajar el preset: " + e.message + " — intento solo el nombre");
+      try {
+        const info = await session.readIdentity();
+        if (info) { current = info; viewBank = Math.floor(info.index / 4); render(); }
+      } catch (e2) { log("tampoco pude leer el nombre: " + e2.message); }
     }
   }
+
+  // ------------------------------------------------------------- cadena de bloques
+  function renderChain() {
+    const ul = $("chain");
+    if (!ul) return;
+    ul.innerHTML = "";
+    if (!preset) return;
+    for (const b of preset.blocks) {
+      const li = document.createElement("li");
+      li.className = "blk";
+      if (b.empty) {
+        li.classList.add("empty");
+        li.innerHTML = `<span class="bar"></span><div class="txt"><div class="cat">Slot ${b.slot}</div><div class="mdl">Vacío</div></div><span></span>`;
+        ul.appendChild(li);
+        continue;
+      }
+      const m = modelInfo(b.model);
+      const color = CAT_COLORS[m.cat];
+      if (color) li.style.setProperty("--cat", color);
+      if (!b.enabled) li.classList.add("off");
+      const bar = document.createElement("span"); bar.className = "bar";
+      const txt = document.createElement("div"); txt.className = "txt";
+      const cat = document.createElement("div"); cat.className = "cat"; cat.textContent = m.cat || `Slot ${b.slot}`;
+      const mdl = document.createElement("div"); mdl.className = "mdl"; mdl.textContent = m.name;
+      txt.append(cat, mdl);
+      const tog = document.createElement("button");
+      tog.className = "tog" + (b.enabled ? " on" : "");
+      tog.textContent = b.enabled ? "ON" : "OFF";
+      tog.setAttribute("aria-label", `${m.name}: ${b.enabled ? "encendido" : "apagado"}`);
+      tog.addEventListener("click", () => toggleBlock(b, tog));
+      li.append(bar, txt, tog);
+      ul.appendChild(li);
+    }
+  }
+
+  async function toggleBlock(b, btn) {
+    if (!session || btn.classList.contains("busy")) return;
+    const want = !b.enabled;
+    btn.classList.add("busy");
+    try {
+      await session.setEnabled(b.slot, want);
+      b.enabled = want;
+      log(`bloque ${b.slot} (${modelInfo(b.model).name}) ${want ? "encendido" : "apagado"}`);
+    } catch (e) {
+      log(`no pude ${want ? "prender" : "apagar"} el bloque ${b.slot}: ${e.message}`);
+    }
+    renderChain();
+  }
+
+  // ------------------------------------------------------------- pantalla encendida
+  async function keepScreenOn() {
+    if (!("wakeLock" in navigator) || wakeLock) return;
+    try {
+      wakeLock = await navigator.wakeLock.request("screen");
+      wakeLock.addEventListener("release", () => { wakeLock = null; });
+    } catch (_) { /* el teléfono puede negarlo (batería baja); no es grave */ }
+  }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && session) keepScreenOn();
+  });
   function refreshSoon(ms = 250) {
     clearTimeout(refreshTimer);
     refreshTimer = setTimeout(refresh, ms);
@@ -854,6 +1152,8 @@
       render();
       refreshSoon();
     } else if (p.kind === "bypass") {
+      const b = preset && preset.blocks.find((x) => x.slot === p.slot);
+      if (b && b.enabled !== p.enabled) { b.enabled = p.enabled; renderChain(); }
       if (!repeated) log(`pedal: bloque ${p.slot} ${p.enabled ? "encendido" : "apagado"}`);
     } else if (p.kind === "param") {
       // El bloque 1 del Pod Go es el pedal de volumen: el pedal de expresión manda
@@ -891,7 +1191,9 @@
     $("btnDisconnect").disabled = true;
     $("connectBox").classList.remove("hidden");
     $("nowBox").classList.add("hidden");
+    $("chainBox").classList.add("hidden");
     $("pickBox").classList.add("hidden");
+    if (wakeLock) { try { await wakeLock.release(); } catch (_) {} wakeLock = null; }
   }
 
   // ------------------------------------------------------------- MIDI
@@ -946,7 +1248,7 @@
   }
 
   $("btnConnect").addEventListener("click", connect);
-  $("btnDisconnect").addEventListener("click", async () => { await teardown(true); setStatus("", "Desconectado"); });
+  $("btnDisconnect").addEventListener("click", async () => { wantConnected = false; await teardown(true); setStatus("", "Desconectado"); });
   $("btnRefresh").addEventListener("click", refresh);
   $("bankPrev").addEventListener("click", () => { viewBank = (viewBank + 31) % 32; render(); });
   $("bankNext").addEventListener("click", () => { viewBank = (viewBank + 1) % 32; render(); });
@@ -966,10 +1268,34 @@
     catch (_) { log("no pude copiar; selecciónalo a mano"); }
   });
 
+  // ------------------------------------------------------------- reconexión automática
+  // Chrome recuerda el permiso: si el Pod Go vuelve (cable o pedal), nos conectamos solos,
+  // salvo que hayas tocado "Desconectar" a propósito.
+  const autoPref = () => { try { return localStorage.getItem("pgr.auto") !== "0"; } catch (_) { return true; } };
+  const setAutoPref = (on) => { try { localStorage.setItem("pgr.auto", on ? "1" : "0"); } catch (_) {} };
+  $("btnConnect").addEventListener("click", () => setAutoPref(true));
+  $("btnDisconnect").addEventListener("click", () => setAutoPref(false));
+
   if ("usb" in navigator) {
     navigator.usb.addEventListener("disconnect", (ev) => {
-      if (device && ev.device === device) { log("se desconectó el cable"); setStatus("", "Desconectado"); teardown(false); }
+      if (device && ev.device === device) {
+        log("se desconectó el cable — me reconecto solo cuando vuelva");
+        setStatus("", "Desconectado");
+        teardown(false);
+      }
     });
+    navigator.usb.addEventListener("connect", (ev) => {
+      if (isPodGo(ev.device) && !session && (wantConnected || autoPref())) {
+        log("volvió el Pod Go — reconectando");
+        setTimeout(() => connectDevice(ev.device), 600); // darle un respiro al pedal
+      }
+    });
+    if (!problems.length && autoPref()) {
+      navigator.usb.getDevices().then((list) => {
+        const d = list.find(isPodGo);
+        if (d) { log("Pod Go ya autorizado — conectando"); connectDevice(d); }
+      }).catch(() => {});
+    }
   }
   // Al salir de la página, devolver el pedal a modo normal
   window.addEventListener("pagehide", () => { if (session) session.close(); });
