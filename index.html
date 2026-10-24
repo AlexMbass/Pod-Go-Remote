@@ -136,7 +136,7 @@
 </section>
 
 <footer>
-  v0.1 · solo lectura por USB + cambios por MIDI · protocolo basado en
+  v0.1.1 · solo lectura por USB + cambios por MIDI · protocolo basado en
   <a href="https://github.com/john-baxter-dev/fretwire" target="_blank" rel="noopener">fretwire</a>
 </footer>
 
@@ -563,12 +563,25 @@
       return this.waitFrame((f) => f.src === frame.dst && f.cmd !== CMD.IDLE && accept(f), ms);
     }
 
-    async channelRequestTxn([src, dst], cmd, body, txn) {
+    /**
+     * Envía un comando de edición y espera la respuesta con el mismo número de transacción.
+     * Por defecto un rechazo lanza error; con `tolerate` solo se anota (como hace fretwire en
+     * los pasos preparatorios de la lectura, que el Pod Go a veces rechaza sin consecuencias).
+     */
+    async channelRequestTxn([src, dst], cmd, body, txn, { op = "?", tolerate = false } = {}) {
       const frame = { src, dst, seq: this.nextSeq(src), cmd, arg: this.curArg(src), body };
       const reply = await this.request(frame, 3000, (f) => replyTxn(f.body) === txn);
       this.advanceArg(src, reply.body.length);
       const refusal = replyRefusal(reply.body);
-      if (refusal !== null) throw new Error("el pedal rechazó el comando (código " + refusal + ")");
+      if (refusal !== null) {
+        if (!tolerate) throw new Error(`el pedal rechazó la op ${op} (código ${refusal})`);
+        if (!this._refusalNoted) this._refusalNoted = new Set();
+        const key = op + ":" + refusal;
+        if (!this._refusalNoted.has(key)) {
+          this._refusalNoted.add(key);
+          this.log(`aviso: el pedal rechazó la op ${op} (código ${refusal}); sigo igual que fretwire`);
+        }
+      }
       return reply;
     }
 
@@ -598,12 +611,14 @@
     readIdentity() {
       return this.exclusive(async () => {
         let t = ++this.txn;
-        await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, readOpen(t)), t);
+        await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, readOpen(t)), t, { op: 76, tolerate: true });
         t = ++this.txn;
-        await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readPrep(t)), t);
+        await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readPrep(t)), t, { op: 24, tolerate: true });
         t = ++this.txn;
-        const r = await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readInfo(t)), t);
-        return parsePresetInfo(r.body);
+        const r = await this.channelRequestTxn(CH.EDIT, CMD.STREAM, tlvCommand(TLV_PARAM_SET, readInfo(t)), t, { op: 23 });
+        const info = parsePresetInfo(r.body);
+        if (!info) this.log("respuesta de op 23 sin preset: " + hex(r.body.slice(0, 64)));
+        return info;
       });
     }
 
@@ -817,17 +832,41 @@
     refreshTimer = setTimeout(refresh, ms);
   }
 
+  // El pedal suele mandar cada aviso dos veces seguidas; solo anotamos el primero.
+  let lastPushKey = "", lastPushAt = 0, lastExpLog = 0, expMoves = 0;
   function onPush(p) {
+    const key = JSON.stringify(p);
+    const now = Date.now();
+    const repeated = key === lastPushKey && now - lastPushAt < 500;
+    lastPushKey = key; lastPushAt = now;
+
     if (p.kind === "snapshot") {
-      log(`pedal: snapshot ${p.index + 1}`);
-      if (current) { current.snapshot = p.index; render(); }
+      if (!repeated) log(`pedal: snapshot ${p.index + 1}`);
+      current = current || { bank: null, index: null, name: "", snapshot: null };
+      current.snapshot = p.index;
+      render();
     } else if (p.kind === "preset") {
+      if (repeated) return;
       log(`pedal: cambio de preset (${P.slotLabel(p.index)})`);
+      current = Object.assign(current || { bank: null, name: "" }, { index: p.index, snapshot: null });
+      current.name = "";
+      viewBank = Math.floor(p.index / 4);
+      render();
       refreshSoon();
     } else if (p.kind === "bypass") {
-      log(`pedal: bloque ${p.slot} ${p.enabled ? "encendido" : "apagado"}`);
+      if (!repeated) log(`pedal: bloque ${p.slot} ${p.enabled ? "encendido" : "apagado"}`);
     } else if (p.kind === "param") {
-      log(`pedal: perilla en bloque ${p.slot}, parámetro ${p.param}`);
+      // El bloque 1 del Pod Go es el pedal de volumen: el pedal de expresión manda
+      // micro-movimientos todo el tiempo. Los resumimos en vez de llenar el registro.
+      if (p.slot === 1) {
+        expMoves++;
+        if (now - lastExpLog > 10000) {
+          log(`pedal: el pedal de expresión se movió (${expMoves} aviso${expMoves === 1 ? "" : "s"})`);
+          lastExpLog = now; expMoves = 0;
+        }
+      } else if (!repeated) {
+        log(`pedal: perilla en bloque ${p.slot}, parámetro ${p.param}`);
+      }
     }
   }
 
@@ -886,9 +925,10 @@
   // ------------------------------------------------------------- pantalla
   function render() {
     if (current) {
-      $("nowSlot").textContent = P.slotLabel(current.index);
-      $("nowName").textContent = current.name || "(sin nombre)";
-      $("nowMeta").textContent = current.bank === 1 ? "Lista User" : current.bank === 0 ? "Lista Factory" : `Lista ${current.bank}`;
+      const known = typeof current.index === "number";
+      $("nowSlot").textContent = known ? P.slotLabel(current.index) : "--";
+      $("nowName").textContent = current.name || (known ? "Leyendo…" : "—");
+      $("nowMeta").textContent = current.bank === 1 ? "Lista User" : current.bank === 0 ? "Lista Factory" : "";
       document.querySelectorAll("#snaps button").forEach((b) =>
         b.classList.toggle("active", Number(b.dataset.snap) === current.snapshot));
     }
