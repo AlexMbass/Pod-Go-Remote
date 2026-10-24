@@ -96,6 +96,28 @@
   }
   .tog.on { background: var(--ok); border-color: var(--ok); color: #062512; }
   .tog.busy { opacity: .5; }
+  .blk .txt { cursor: pointer; }
+  .blk .chev { color: var(--muted); font-size: 12px; margin-left: 6px; }
+  .blk.open { border-color: var(--cat, var(--accent)); }
+  .params { grid-column: 1 / -1; padding: 6px 4px 6px 18px; display: grid; gap: 14px; }
+  .prm { display: grid; gap: 6px; }
+  .prm .top { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .prm .pn { font-size: 14px; color: var(--muted); }
+  .prm .pv { font-size: 16px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .prm.err .pv { color: var(--bad); }
+  input[type=range] {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 36px; background: transparent; margin: 0; touch-action: pan-y;
+  }
+  input[type=range]::-webkit-slider-runnable-track { height: 8px; border-radius: 99px; background: linear-gradient(to right, var(--cat, var(--accent)) var(--pct, 0%), #3a4047 var(--pct, 0%)); }
+  input[type=range]::-moz-range-track { height: 8px; border-radius: 99px; background: #3a4047; }
+  input[type=range]::-moz-range-progress { height: 8px; border-radius: 99px; background: var(--cat, var(--accent)); }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 30px; height: 30px; margin-top: -11px; border-radius: 50%; background: var(--text); border: 3px solid var(--cat, var(--accent)); }
+  input[type=range]::-moz-range-thumb { width: 26px; height: 26px; border-radius: 50%; background: var(--text); border: 3px solid var(--cat, var(--accent)); }
+  .prm .sw { display: flex; gap: 8px; }
+  .prm .sw button { flex: 1; min-height: 44px; }
+  .prm .sw button.sel { background: var(--cat, var(--accent)); color: #111; border-color: transparent; font-weight: 700; }
+  .stepper { display: grid; grid-template-columns: 56px 1fr 56px; gap: 8px; align-items: center; }
+  .stepper output { text-align: center; font-weight: 700; font-size: 18px; }
   .catload { display: flex; flex-direction: column; gap: 10px; }
   .catload input[type=file] { display: none; }
   .ok-text { color: var(--ok); }
@@ -133,7 +155,7 @@
 <section id="chainBox" class="hidden">
   <h2>Cadena de bloques</h2>
   <ul class="chain" id="chain"></ul>
-  <p class="hint" id="chainHint">Toca ON/OFF para prender o apagar un bloque. Es temporal: si cambias de preset sin guardar en el pedal, vuelve como estaba.</p>
+  <p class="hint" id="chainHint">Toca el nombre de un bloque para ver sus perillas, y ON/OFF para prenderlo o apagarlo. Los cambios son temporales: para que se queden, guarda el preset en el pedal.</p>
 </section>
 
 <section id="pickBox" class="hidden">
@@ -174,7 +196,7 @@
 </section>
 
 <footer>
-  v0.2 · bloques por USB + cambios por MIDI · protocolo basado en
+  v0.3 · bloques y perillas por USB + cambios por MIDI · protocolo basado en
   <a href="https://github.com/john-baxter-dev/fretwire" target="_blank" rel="noopener">fretwire</a>
 </footer>
 
@@ -230,7 +252,7 @@
 
   // Claves del sobre MessagePack
   const K = { TXN: 102, OP: 100, TARGET: 101, KIND: 103, PAYLOAD: 104 };
-  const OP = { READ_OPEN: 76, READ_PREP: 24, READ_INFO: 23, STREAM_START: 22, BYPASS: 41 };
+  const OP = { READ_OPEN: 76, READ_PREP: 24, READ_INFO: 23, STREAM_START: 22, BYPASS: 41, SET_VALUE: 30 };
 
   // ---------------------------------------------------------------- utilidades
   function hex(bytes) {
@@ -315,6 +337,12 @@
     if (v === null || v === undefined) return Uint8Array.of(0xc0);
     if (v === true) return Uint8Array.of(0xc3);
     if (v === false) return Uint8Array.of(0xc2);
+    if (v && typeof v === "object" && "__f32" in v) {
+      const out = new Uint8Array(5);
+      out[0] = 0xca;
+      new DataView(out.buffer).setFloat32(1, v.__f32); // big-endian, como MessagePack
+      return out;
+    }
     if (typeof v === "number") {
       if (!Number.isInteger(v)) throw new Error("mpEncode: solo enteros");
       if (v >= 0) {
@@ -341,6 +369,17 @@
     return pairs;
   }
 
+  /** Tipo de un valor MessagePack por su primer byte: "f32", "f64", "int", "bool" u "other". */
+  function wireType(b) {
+    if (b === 0xca) return "f32";
+    if (b === 0xcb) return "f64";
+    if (b === 0xc2 || b === 0xc3) return "bool";
+    if (b <= 0x7f || b >= 0xe0 || (b >= 0xcc && b <= 0xd3)) return "int";
+    return "other";
+  }
+  /** Envuelve un número para que mpEncode lo mande como float32 (0xca), igual que el pedal. */
+  const f32 = (x) => ({ __f32: x });
+
   // Decodificador: completo para lo que el pedal manda. Devuelve {value, end} o lanza.
   function mpDecode(buf, pos) {
     const b = buf[pos];
@@ -351,7 +390,12 @@
     const bytes = (p, n) => { need(p, n); return { value: buf.slice(p, p + n), end: p + n }; };
     const arr = (p, n) => {
       const out = [];
-      for (let i = 0; i < n; i++) { const r = mpDecode(buf, p); out.push(r.value); p = r.end; }
+      const types = []; // tipo exacto en el cable de cada elemento (el pedal exige el mismo al escribir)
+      for (let i = 0; i < n; i++) {
+        types.push(wireType(buf[p]));
+        const r = mpDecode(buf, p); out.push(r.value); p = r.end;
+      }
+      Object.defineProperty(out, "types", { value: types, enumerable: false });
       return { value: out, end: p };
     };
     const map = (p, n) => {
@@ -423,6 +467,19 @@
   const bypass = (slot, enabled, txn) =>
     mpEncode(omap([[K.TXN, txn], [K.OP, OP.BYPASS], [K.TARGET, omap([[98, slot], [59, !!enabled]])]]));
 
+  /**
+   * Cambiar el valor de un parámetro (op 30). `type` tiene que ser el mismo que el pedal tiene
+   * guardado para ese parámetro ("f32", "int" o "bool"); si no, el pedal lo rechaza con -3.
+   * Orden de claves igual que Pod Go Edit: 98, 29, 26, 28, 119.
+   */
+  function setValue(slot, param, value, type, txn) {
+    let v;
+    if (type === "bool") v = !!value;
+    else if (type === "int") v = Math.round(value);
+    else v = f32(value);
+    return mpEncode(omap([[K.TXN, txn], [K.OP, OP.SET_VALUE], [K.TARGET, omap([[98, slot], [29, true], [26, 0], [28, param], [119, v]])]]));
+  }
+
   /** Largo total que declara el primer trozo del preset (cabecera TLV + contenido). */
   function declaredStreamLen(chunk0) {
     if (chunk0.length < 8) return null;
@@ -460,6 +517,7 @@
           model: mget(meta, 25), paired: mget(meta, 26),
           enabled: mget(c, 10) !== false, cls: mget(c, 9),
           params: (bank && mget(bank, 4)) || [],
+          paramTypes: (bank && mget(bank, 4) && mget(bank, 4).types) || [],
         });
       } else if (kind === 7 && c instanceof Map) {
         const bank = mget(c, 7);
@@ -467,6 +525,7 @@
           slot: i, kind, looper: true, model: mget(c, 8), paired: -1,
           enabled: mget(c, 10) !== false, cls: mget(c, 9),
           params: (bank && mget(bank, 4)) || [],
+          paramTypes: (bank && mget(bank, 4) && mget(bank, 4).types) || [],
         });
       } else if (kind === 8) {
         blocks.push({ slot: i, kind, empty: true });
@@ -561,7 +620,11 @@
       return { kind: "bypass", slot: mget(m, 98), enabled: mget(m, 59) };
     if (typeof mget(m, 108) === "number") return { kind: "preset", index: mget(m, 108) };
     if (typeof mget(m, 98) === "number" && typeof mget(m, 28) === "number" && mget(m, 119) !== undefined)
-      return { kind: "param", slot: mget(m, 98), param: mget(m, 28), value: mget(m, 119) };
+      return {
+        kind: "param", slot: mget(m, 98), param: mget(m, 28), value: mget(m, 119),
+        extra: mget(m, 29) === false, // true = valores "extra" (trails, mic), otro espacio de índices
+        paired: mget(m, 26) === 1,
+      };
     return { kind: "other", type };
   }
 
@@ -785,10 +848,26 @@
      */
     setEnabled(slot, enabled) {
       if (!Number.isInteger(slot) || slot < 1 || slot > 10) return Promise.reject(new Error("bloque fuera de la cadena"));
+      return this._edit(41, (t) => bypass(slot, enabled, t));
+    }
+
+    /**
+     * Cambia un parámetro del bloque (op 30): misma regla que setEnabled — es temporal hasta que
+     * guardes en el pedal. `type` es el tipo que el pedal tiene guardado ("f32", "int", "bool").
+     */
+    setValue(slot, param, value, type) {
+      if (!Number.isInteger(slot) || slot < 1 || slot > 10) return Promise.reject(new Error("bloque fuera de la cadena"));
+      if (!Number.isInteger(param) || param < 0 || param > 63) return Promise.reject(new Error("parámetro inválido"));
+      if (!["f32", "int", "bool"].includes(type)) return Promise.reject(new Error("tipo de valor desconocido: " + type));
+      if (type !== "bool" && !Number.isFinite(value)) return Promise.reject(new Error("valor inválido"));
+      return this._edit(30, (t) => setValue(slot, param, value, type, t));
+    }
+
+    /** Envía una edición, espera que el pedal la acepte y manda el "flush" como Pod Go Edit. */
+    _edit(op, build) {
       return this.exclusive(async () => {
         const t = ++this.txn;
-        await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, bypass(slot, enabled, t)), t, { op: 41 });
-        // El "flush" que manda Pod Go Edit después de cada edición; no espera respuesta.
+        await this.channelRequestTxn(CH.EDIT, CMD.OPEN, tlvCommand(TLV_PARAM_SET, build(t)), t, { op });
         const [src, dst] = CH.EDIT;
         await this.send({ src, dst, seq: this.nextSeq(src), cmd: CMD.CHUNK, arg: this.curArg(src), body: new Uint8Array(0) });
       });
@@ -842,7 +921,7 @@
   const API = {
     VENDOR_ID, PRODUCTS, CONTROL_INTERFACE, EP_OUT, EP_IN, CH, CMD, OP, K,
     hex, fromHex, encodeFrame, decodeAll, tlvCommand, mpEncode, mpDecode, omap,
-    readOpen, readPrep, readInfo, streamStart, bypass, declaredStreamLen, parsePresetStream, handshakeFrames, replyTxn, replyRefusal,
+    readOpen, readPrep, readInfo, streamStart, bypass, setValue, f32, wireType, declaredStreamLen, parsePresetStream, handshakeFrames, replyTxn, replyRefusal,
     parsePresetInfo, parseStatusPush, asciiRun, slotLabel, locateRoot, Session,
   };
   if (typeof module !== "undefined" && module.exports) module.exports = API;
@@ -1067,6 +1146,8 @@
   }
 
   // ------------------------------------------------------------- cadena de bloques
+  let openSlot = null; // bloque con el editor abierto
+
   function renderChain() {
     const ul = $("chain");
     if (!ul) return;
@@ -1075,6 +1156,7 @@
     for (const b of preset.blocks) {
       const li = document.createElement("li");
       li.className = "blk";
+      li.dataset.slot = b.slot;
       if (b.empty) {
         li.classList.add("empty");
         li.innerHTML = `<span class="bar"></span><div class="txt"><div class="cat">Slot ${b.slot}</div><div class="mdl">Vacío</div></div><span></span>`;
@@ -1088,16 +1170,175 @@
       const bar = document.createElement("span"); bar.className = "bar";
       const txt = document.createElement("div"); txt.className = "txt";
       const cat = document.createElement("div"); cat.className = "cat"; cat.textContent = m.cat || `Slot ${b.slot}`;
-      const mdl = document.createElement("div"); mdl.className = "mdl"; mdl.textContent = m.name;
+      const mdl = document.createElement("div"); mdl.className = "mdl";
+      mdl.textContent = m.name;
+      const chev = document.createElement("span"); chev.className = "chev"; chev.textContent = openSlot === b.slot ? "▲" : "▼";
+      mdl.appendChild(chev);
       txt.append(cat, mdl);
+      txt.addEventListener("click", () => { openSlot = openSlot === b.slot ? null : b.slot; renderChain(); });
       const tog = document.createElement("button");
       tog.className = "tog" + (b.enabled ? " on" : "");
       tog.textContent = b.enabled ? "ON" : "OFF";
       tog.setAttribute("aria-label", `${m.name}: ${b.enabled ? "encendido" : "apagado"}`);
       tog.addEventListener("click", () => toggleBlock(b, tog));
       li.append(bar, txt, tog);
+      if (openSlot === b.slot) { li.classList.add("open"); li.appendChild(renderParams(b)); }
       ul.appendChild(li);
     }
+  }
+
+  // ------------------------------------------------------------- perillas
+  // Lista de parámetros "normales" del bloque (los del modelo; se omiten extras como trails).
+  function paramDefs(b) {
+    const cat = catalog && catalog[b.model];
+    const defs = cat ? cat[2] : [];
+    const n = cat ? Math.min(defs.length, b.params.length) : b.params.length;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const d = defs[i] || [`Parámetro ${i + 1}`, null, null, null, null];
+      const type = b.paramTypes[i] || (d[4] === 2 ? "bool" : d[4] === 0 ? "int" : "f32");
+      if (!["f32", "int", "bool"].includes(type)) continue;
+      out.push({ index: i, name: d[0], min: d[1], max: d[2], type });
+    }
+    return out;
+  }
+
+  const isHz = (p) => /cut|freq|fc |fc$|xover|^fc/i.test(p.name) && p.max >= 100;
+  const isDb = (p) => /level|gain|send|return|headroom|thresh|boost|trim/i.test(p.name) && p.min < 0;
+  const isTime = (p) => /time|predelay|^delay$/i.test(p.name) && p.max <= 10;
+  const isUnit = (p) => p.min === 0 && p.max === 1;
+
+  function fmt(p, v) {
+    if (p.type === "bool") return v ? "On" : "Off";
+    if (p.type === "int") return String(v);
+    if (isUnit(p)) return (v * 10).toFixed(1);
+    if (isDb(p)) return (v > 0 ? "+" : "") + v.toFixed(1) + " dB";
+    if (isHz(p)) return v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 1 : 2) + " kHz" : Math.round(v) + " Hz";
+    if (isTime(p)) return Math.round(v * 1000) + " ms";
+    if (/rate|speed/i.test(p.name)) return v.toFixed(2) + " Hz";
+    return Math.abs(v) >= 100 ? v.toFixed(0) : v.toFixed(2);
+  }
+
+  // Posición del deslizador (0..1000) ↔ valor real. Los filtros en Hz van en escala logarítmica.
+  const useLog = (p) => isHz(p) && p.min > 0;
+  function toPos(p, v) {
+    const t = useLog(p) ? Math.log(v / p.min) / Math.log(p.max / p.min) : (v - p.min) / (p.max - p.min);
+    return Math.round(Math.max(0, Math.min(1, t)) * 1000);
+  }
+  function fromPos(p, pos) {
+    const t = pos / 1000;
+    return useLog(p) ? p.min * Math.pow(p.max / p.min, t) : p.min + t * (p.max - p.min);
+  }
+
+  // Envío "con freno": mientras arrastras, se manda el último valor sin hacer cola.
+  const pending = new Map(); // "slot:param" -> {value, type, busy}
+  function sendValue(b, p, value, row) {
+    const key = b.slot + ":" + p.index;
+    const st = pending.get(key) || { busy: false };
+    st.value = value; st.type = p.type; st.dirty = true;
+    pending.set(key, st);
+    if (st.busy || !session) return;
+    const pump = async () => {
+      st.busy = true;
+      while (st.dirty && session) {
+        st.dirty = false;
+        const v = st.value;
+        try {
+          await session.setValue(b.slot, p.index, v, st.type);
+          b.params[p.index] = v;
+          row && row.classList.remove("err");
+        } catch (e) {
+          row && row.classList.add("err");
+          log(`no pude cambiar ${p.name}: ${e.message}`);
+          st.dirty = false;
+        }
+      }
+      st.busy = false;
+    };
+    pump();
+  }
+
+  function renderParams(b) {
+    const box = document.createElement("div");
+    box.className = "params";
+    const defs = paramDefs(b);
+    if (!defs.length) {
+      box.innerHTML = `<p class="hint">Este bloque no tiene perillas que se puedan mover desde aquí.</p>`;
+      return box;
+    }
+    if (!catalog) {
+      const h = document.createElement("p"); h.className = "hint";
+      h.textContent = "Carga el catálogo para ver los nombres y rangos reales de las perillas.";
+      box.appendChild(h);
+    }
+    for (const p of defs) {
+      const row = document.createElement("div");
+      row.className = "prm";
+      row.dataset.param = p.index;
+      const top = document.createElement("div"); top.className = "top";
+      const pn = document.createElement("span"); pn.className = "pn"; pn.textContent = p.name;
+      const pv = document.createElement("span"); pv.className = "pv";
+      top.append(pn, pv);
+      row.appendChild(top);
+      const cur = b.params[p.index];
+
+      if (p.type === "bool") {
+        const sw = document.createElement("div"); sw.className = "sw";
+        for (const val of [false, true]) {
+          const btn = document.createElement("button");
+          btn.textContent = val ? "On" : "Off";
+          if (!!cur === val) btn.classList.add("sel");
+          btn.addEventListener("click", () => {
+            sw.querySelectorAll("button").forEach((x) => x.classList.toggle("sel", x === btn));
+            pv.textContent = fmt(p, val);
+            sendValue(b, p, val, row);
+          });
+          sw.appendChild(btn);
+        }
+        pv.textContent = fmt(p, !!cur);
+        row.appendChild(sw);
+      } else if (p.type === "int" || p.min === null || p.max === null) {
+        const lo = p.min ?? 0, hi = p.max ?? 127;
+        let val = Math.round(cur ?? lo);
+        const st = document.createElement("div"); st.className = "stepper";
+        const minus = document.createElement("button"); minus.textContent = "−";
+        const plus = document.createElement("button"); plus.textContent = "+";
+        const out = document.createElement("output");
+        const show = () => { out.textContent = val; pv.textContent = ""; };
+        const step = (d) => { const nv = Math.max(lo, Math.min(hi, val + d)); if (nv === val) return; val = nv; show(); sendValue(b, p, p.type === "int" ? val : val * 1.0, row); };
+        minus.addEventListener("click", () => step(-1));
+        plus.addEventListener("click", () => step(1));
+        show();
+        st.append(minus, out, plus);
+        row.appendChild(st);
+      } else {
+        const r = document.createElement("input");
+        r.type = "range"; r.min = 0; r.max = 1000; r.step = 1;
+        r.setAttribute("aria-label", p.name);
+        r.value = toPos(p, cur ?? p.min);
+        const paint = () => { r.style.setProperty("--pct", (r.value / 10) + "%"); pv.textContent = fmt(p, fromPos(p, +r.value)); };
+        r.addEventListener("input", () => { paint(); sendValue(b, p, fromPos(p, +r.value), row); });
+        r.addEventListener("pointerdown", () => { row.dataset.dragging = "1"; });
+        r.addEventListener("pointerup", () => { delete row.dataset.dragging; });
+        paint();
+        row.appendChild(r);
+        row._set = (v) => { if (row.dataset.dragging) return; r.value = toPos(p, v); paint(); };
+      }
+      box.appendChild(row);
+    }
+    return box;
+  }
+
+  // Un aviso de perilla desde el pedal: actualizar el valor (y el deslizador si está abierto).
+  function applyParamPush(p) {
+    if (p.extra || p.paired || !preset) return;
+    const b = preset.blocks.find((x) => x.slot === p.slot);
+    if (!b || b.empty) return;
+    b.params[p.param] = p.value;
+    if (openSlot !== p.slot) return;
+    const row = document.querySelector(`#chain li[data-slot="${p.slot}"] .prm[data-param="${p.param}"]`);
+    if (row && row._set && typeof p.value === "number") row._set(p.value);
+    else if (row) renderChain();
   }
 
   async function toggleBlock(b, btn) {
@@ -1143,6 +1384,7 @@
       current = current || { bank: null, index: null, name: "", snapshot: null };
       current.snapshot = p.index;
       render();
+      if (!repeated && preset) refreshSoon(400); // un snapshot puede cambiar perillas
     } else if (p.kind === "preset") {
       if (repeated) return;
       log(`pedal: cambio de preset (${P.slotLabel(p.index)})`);
@@ -1156,6 +1398,8 @@
       if (b && b.enabled !== p.enabled) { b.enabled = p.enabled; renderChain(); }
       if (!repeated) log(`pedal: bloque ${p.slot} ${p.enabled ? "encendido" : "apagado"}`);
     } else if (p.kind === "param") {
+      applyParamPush(p);
+      if (p.extra) return; // valores "extra" (trails, etc.): no los anotamos
       // El bloque 1 del Pod Go es el pedal de volumen: el pedal de expresión manda
       // micro-movimientos todo el tiempo. Los resumimos en vez de llenar el registro.
       if (p.slot === 1) {
